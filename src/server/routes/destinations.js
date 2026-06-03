@@ -1,0 +1,168 @@
+import express from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import db from '../db/index.js';
+import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
+import logger from '../utils/logger.js';
+
+const router = express.Router();
+
+// Get destinations for a customer
+router.get('/customer/:customerId', authenticateToken, authorizeRoles('admin', 'ppic'), (req, res) => {
+  try {
+    const destinations = db.prepare(
+      'SELECT * FROM customer_destinations WHERE customer_id = ? ORDER BY is_default DESC, name ASC'
+    ).all(req.params.customerId);
+    res.json(destinations);
+  } catch (error) {
+    logger.error('Get destinations error:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch destinations' } });
+  }
+});
+
+// Get all destinations
+router.get('/', authenticateToken, authorizeRoles('admin'), (req, res) => {
+  try {
+    const destinations = db.prepare(`
+      SELECT cd.*, c.name as customer_name
+      FROM customer_destinations cd
+      LEFT JOIN customers c ON cd.customer_id = c.id
+      ORDER BY c.name, cd.name
+    `).all();
+    res.json(destinations);
+  } catch (error) {
+    logger.error('Get all destinations error:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch destinations' } });
+  }
+});
+
+// Get destination by ID
+router.get('/:id', authenticateToken, authorizeRoles('admin', 'ppic'), (req, res) => {
+  try {
+    const destination = db.prepare(`
+      SELECT cd.*, c.name as customer_name
+      FROM customer_destinations cd
+      LEFT JOIN customers c ON cd.customer_id = c.id
+      WHERE cd.id = ?
+    `).get(req.params.id);
+
+    if (!destination) {
+      return res.status(404).json({ error: { message: 'Destination not found' } });
+    }
+    res.json(destination);
+  } catch (error) {
+    logger.error('Get destination error:', error);
+    res.status(500).json({ error: { message: 'Failed to fetch destination' } });
+  }
+});
+
+// Create destination
+router.post('/', authenticateToken, authorizeRoles('admin'), (req, res) => {
+  try {
+    const { customer_id, code, name, is_default, delivery_types } = req.body;
+
+    if (!customer_id || !name) {
+      return res.status(400).json({ error: { message: 'Customer ID and name are required' } });
+    }
+
+    const customer = db.prepare('SELECT id FROM customers WHERE id = ? AND is_active = 1').get(customer_id);
+    if (!customer) {
+      return res.status(404).json({ error: { message: 'Customer not found' } });
+    }
+
+    if (is_default) {
+      db.prepare('UPDATE customer_destinations SET is_default = 0 WHERE customer_id = ?').run(customer_id);
+    }
+
+    const id = uuidv4();
+    db.prepare('INSERT INTO customer_destinations (id, customer_id, code, name, is_default, delivery_types, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime(\'now\'))').run(id, customer_id, code || '', name, is_default ? 1 : 0, delivery_types || '["Regular","CKD","Non Regular"]');
+
+    logger.info('Destination created', { id, customer_id, name, createdBy: req.user.username });
+    const newDest = db.prepare('SELECT * FROM customer_destinations WHERE id = ?').get(id);
+    res.status(201).json(newDest);
+  } catch (error) {
+    logger.error('Create destination error:', error);
+    res.status(500).json({ error: { message: 'Failed to create destination' } });
+  }
+});
+
+// Update destination
+router.patch('/:id', authenticateToken, authorizeRoles('admin'), (req, res) => {
+  try {
+    const { id } = req.params;
+    const { code, name, is_default, delivery_types } = req.body;
+
+    const dest = db.prepare('SELECT * FROM customer_destinations WHERE id = ?').get(id);
+    if (!dest) {
+      return res.status(404).json({ error: { message: 'Destination not found' } });
+    }
+
+    const updates = [];
+    const values = [];
+
+    if (code !== undefined) { updates.push('code = ?'); values.push(code); }
+    if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+    if (delivery_types !== undefined) { updates.push('delivery_types = ?'); values.push(delivery_types); }
+    if (is_default !== undefined) {
+      if (is_default) {
+        db.prepare('UPDATE customer_destinations SET is_default = 0 WHERE customer_id = ?').run(dest.customer_id);
+      }
+      updates.push('is_default = ?');
+      values.push(is_default ? 1 : 0);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: { message: 'No fields to update' } });
+    }
+
+    updates.push('updated_at = datetime(\'now\')');
+    values.push(id);
+    db.prepare('UPDATE customer_destinations SET ' + updates.join(', ') + ' WHERE id = ?').run(...values);
+
+    logger.info('Destination updated', { id, updatedBy: req.user.username });
+    const updated = db.prepare('SELECT * FROM customer_destinations WHERE id = ?').get(id);
+    res.json(updated);
+  } catch (error) {
+    logger.error('Update destination error:', error);
+    res.status(500).json({ error: { message: 'Failed to update destination' } });
+  }
+});
+
+// Delete destination
+router.delete('/:id', authenticateToken, authorizeRoles('admin'), (req, res) => {
+  try {
+    const { id } = req.params;
+    const dest = db.prepare('SELECT * FROM customer_destinations WHERE id = ?').get(id);
+    if (!dest) {
+      return res.status(404).json({ error: { message: 'Destination not found' } });
+    }
+
+    db.prepare('DELETE FROM customer_destinations WHERE id = ?').run(id);
+    logger.info('Destination deleted', { id, name: dest.name, deletedBy: req.user.username });
+    res.json({ message: 'Destination deleted successfully' });
+  } catch (error) {
+    logger.error('Delete destination error:', error);
+    res.status(500).json({ error: { message: 'Failed to delete destination' } });
+  }
+});
+
+// Set as default destination
+router.post('/:id/set-default', authenticateToken, authorizeRoles('admin'), (req, res) => {
+  try {
+    const { id } = req.params;
+    const dest = db.prepare('SELECT * FROM customer_destinations WHERE id = ?').get(id);
+    if (!dest) {
+      return res.status(404).json({ error: { message: 'Destination not found' } });
+    }
+
+    db.prepare('UPDATE customer_destinations SET is_default = 0 WHERE customer_id = ?').run(dest.customer_id);
+    db.prepare('UPDATE customer_destinations SET is_default = 1, updated_at = datetime(\'now\') WHERE id = ?').run(id);
+
+    logger.info('Destination set as default', { id, customer_id: dest.customer_id });
+    res.json({ message: 'Destination set as default successfully' });
+  } catch (error) {
+    logger.error('Set default error:', error);
+    res.status(500).json({ error: { message: 'Failed to set default' } });
+  }
+});
+
+export default router;
